@@ -17,6 +17,7 @@ from telegram_notify import escape_html, send_telegram_report, send_telegram_tex
 LOGIN_URL = "https://panel.play.hosting/auth/login"
 SCREENSHOT_DIR = "screenshots"
 BASE_PROXY_PORT = 10808
+MAX_ACCOUNT_RETRIES = 2
 
 VIEWPORT_POOL = [
     {"width": 1366, "height": 768},
@@ -129,6 +130,14 @@ def get_body_text(sb: Any) -> str:
     return str(text or "")
 
 
+def get_input_value(sb: Any, css_selector: str) -> str:
+    js = f"""(() => {{
+        const el = document.querySelector({json.dumps(css_selector)});
+        return el ? (el.value || '') : '';
+    }})()"""
+    return str(cdp_eval(sb, js, "") or "")
+
+
 def is_css_visible(sb: Any, css_selector: str) -> bool:
     js = f"""(() => {{
         const el = document.querySelector({json.dumps(css_selector)});
@@ -153,6 +162,34 @@ def is_button_text_visible(sb: Any, text: str) -> bool:
         }});
     }})()"""
     return bool(cdp_eval(sb, js, False))
+
+
+def has_turnstile_widget(sb: Any) -> bool:
+    """检查登录页是否真正加载出了 Cloudflare Turnstile 组件"""
+    js = """(() => {
+        if (document.querySelector('input[name="cf-turnstile-response"]')) return true;
+        if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) return true;
+        if (document.querySelector('.cf-turnstile')) return true;
+        return false;
+    })()"""
+    return bool(cdp_eval(sb, js, False))
+
+
+def get_top_status_badge(sb: Any) -> str:
+    """精准读取顶部状态栏胶囊文案（Online / Starting / Offline / Stopping）"""
+    js = """(() => {
+        const els = Array.from(document.querySelectorAll('span, div, p'));
+        for (const el of els) {
+            const r = el.getBoundingClientRect();
+            if (r.top < 0 || r.top > 120 || r.width <= 0 || r.height <= 0 || r.width > 200) continue;
+            const t = (el.innerText || '').trim();
+            if (t === 'Online' || t === 'Starting' || t === 'Offline' || t === 'Stopping') {
+                return t.toLowerCase();
+            }
+        }
+        return '';
+    })()"""
+    return str(cdp_eval(sb, js, "") or "")
 
 
 def dismiss_consent_modal(sb: Any) -> bool:
@@ -194,6 +231,54 @@ def dismiss_consent_modal(sb: Any) -> bool:
         sb.sleep(1.5)
         return True
     return False
+
+
+def fill_input_verified(sb: Any, css_selector: str, value: str, label: str) -> None:
+    """输入文本并校验实际写入值，防止被延迟弹出的 GDPR 弹窗遮挡导致漏填"""
+    for attempt in range(1, 4):
+        dismiss_consent_modal(sb)
+        try:
+            sb.cdp.click(css_selector)
+            sb.sleep(random.uniform(0.2, 0.4))
+            cdp_eval(
+                sb,
+                f"""(() => {{
+                    const el = document.querySelector({json.dumps(css_selector)});
+                    if (el) {{
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                        setter.call(el, '');
+                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        el.focus();
+                    }}
+                }})()""",
+                None,
+            )
+            sb.cdp.type(css_selector, value)
+            sb.sleep(random.uniform(0.3, 0.6))
+        except Exception as e:
+            print(f"[Auth] 第 {attempt} 次填写 {label} 异常: {e}")
+
+        if get_input_value(sb, css_selector) == value:
+            return
+
+        print(f"[Auth] 第 {attempt} 次填写 {label} 未生效（可能被弹窗遮挡），清理弹窗后重试...")
+        dismiss_consent_modal(sb)
+        sb.sleep(0.8)
+
+    cdp_eval(
+        sb,
+        f"""(() => {{
+            const el = document.querySelector({json.dumps(css_selector)});
+            if (el) {{
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                setter.call(el, {json.dumps(value)});
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            }}
+        }})()""",
+        None,
+    )
+    sb.sleep(0.4)
 
 
 def click_button_by_text(
@@ -263,55 +348,58 @@ def get_turnstile_token(sb: Any) -> str:
     return str(token or "")
 
 
-def click_turnstile_by_pyautogui(sb: Any) -> bool:
+def click_turnstile_by_pyautogui(sb: Any, allow_generic_box: bool = False) -> bool:
     import pyautogui
 
     pyautogui.FAILSAFE = False
 
     info = cdp_eval(
         sb,
-        """(() => {
+        f"""(() => {{
             const winX = window.screenX || 0;
             const winY = window.screenY || 0;
             const barH = Math.max(0, window.outerHeight - window.innerHeight);
             const barW = Math.max(0, window.outerWidth - window.innerWidth);
+            const allowGeneric = {json.dumps(allow_generic_box)};
 
             const sels = [
                 'iframe[src*="challenges.cloudflare.com"]',
                 'iframe[title*="Cloudflare"]',
                 'iframe[title*="challenge"]'
             ];
-            for (const sel of sels) {
+            for (const sel of sels) {{
                 const el = document.querySelector(sel);
-                if (el) {
+                if (el) {{
                     const r = el.getBoundingClientRect();
-                    if (r.width > 20 && r.height > 20) {
-                        return { source: sel, winX, winY, barW, barH, left: r.left, top: r.top, width: r.width, height: r.height };
-                    }
-                }
-            }
+                    if (r.width > 20 && r.height > 20) {{
+                        return {{ source: sel, winX, winY, barW, barH, left: r.left, top: r.top, width: r.width, height: r.height }};
+                    }}
+                }}
+            }}
 
             const inp = document.querySelector('input[name="cf-turnstile-response"]');
-            if (inp) {
+            if (inp) {{
                 let el = inp.parentElement;
-                while (el && el !== document.body) {
+                while (el && el !== document.body) {{
                     const r = el.getBoundingClientRect();
-                    if (r.width >= 150 && r.height >= 45 && r.height <= 140) {
-                        return { source: 'turnstile-parent', winX, winY, barW, barH, left: r.left, top: r.top, width: r.width, height: r.height };
-                    }
+                    if (r.width >= 150 && r.height >= 45 && r.height <= 140) {{
+                        return {{ source: 'turnstile-parent', winX, winY, barW, barH, left: r.left, top: r.top, width: r.width, height: r.height }};
+                    }}
                     el = el.parentElement;
-                }
-            }
+                }}
+            }}
 
-            const divs = Array.from(document.querySelectorAll('div'));
-            for (const d of divs) {
-                const r = d.getBoundingClientRect();
-                if (r.width >= 260 && r.width <= 360 && r.height >= 55 && r.height <= 90 && r.top > 120 && r.top < 600) {
-                    return { source: 'widget-box', winX, winY, barW, barH, left: r.left, top: r.top, width: r.width, height: r.height };
-                }
-            }
+            if (allowGeneric) {{
+                const divs = Array.from(document.querySelectorAll('div'));
+                for (const d of divs) {{
+                    const r = d.getBoundingClientRect();
+                    if (r.width >= 260 && r.width <= 360 && r.height >= 55 && r.height <= 90 && r.top > 120 && r.top < 600) {{
+                        return {{ source: 'widget-box', winX, winY, barW, barH, left: r.left, top: r.top, width: r.width, height: r.height }};
+                    }}
+                }}
+            }}
             return null;
-        })()""",
+        }})()""",
         None,
     )
 
@@ -343,7 +431,7 @@ def click_turnstile_by_pyautogui(sb: Any) -> bool:
     return True
 
 
-def attempt_click_cf(sb: Any, attempt_no: int) -> None:
+def attempt_click_cf(sb: Any, attempt_no: int, allow_generic_box: bool = False) -> None:
     if attempt_no % 2 == 1:
         try:
             print(f"[Auth] 第 {attempt_no} 次过盾尝试：SeleniumBase uc_gui_click_captcha()")
@@ -354,7 +442,7 @@ def attempt_click_cf(sb: Any, attempt_no: int) -> None:
 
     print(f"[Auth] 第 {attempt_no} 次过盾尝试：PyAutoGUI 精确坐标点击")
     try:
-        if not click_turnstile_by_pyautogui(sb):
+        if not click_turnstile_by_pyautogui(sb, allow_generic_box=allow_generic_box):
             sb.uc_gui_click_captcha()
     except Exception as e:
         print(f"[Auth] 精确坐标点击异常: {e}")
@@ -412,7 +500,7 @@ def wait_for_login_form_or_bypass_cf(sb: Any, max_wait: int = 80) -> None:
             and (time.time() - last_click_ts >= 13)
         ):
             clicked_times += 1
-            attempt_click_cf(sb, clicked_times)
+            attempt_click_cf(sb, clicked_times, allow_generic_box=True)
             last_click_ts = time.time()
             sb.sleep(5)
             continue
@@ -425,33 +513,47 @@ def wait_for_login_form_or_bypass_cf(sb: Any, max_wait: int = 80) -> None:
     )
 
 
-def wait_and_solve_login_turnstile(sb: Any, max_wait: int = 55) -> bool:
+def wait_and_solve_login_turnstile(sb: Any, max_wait: int = 55) -> str:
+    """
+    返回值：
+    - "passed": 已拿到有效 Turnstile Token
+    - "missing": 超过 16s 页面仍未渲染出 Turnstile 组件（需刷新页面）
+    - "timeout": 验证框存在但超时未通过
+    """
     print("[Auth] 等待登录页 Cloudflare Turnstile 验证...")
     start_ts = time.time()
     clicked_times = 0
     last_click_ts = 0.0
 
     while time.time() - start_ts < max_wait:
-        # 防止 GDPR 隐私弹窗延迟弹出遮挡验证框
         dismiss_consent_modal(sb)
 
         token = get_turnstile_token(sb)
         if len(token) > 10:
             print("[Auth] 登录页 Turnstile 验证已通过")
-            return True
+            return "passed"
 
         elapsed = time.time() - start_ts
+        widget_present = has_turnstile_widget(sb)
+
+        if not widget_present:
+            if elapsed >= 16:
+                print("[Auth] 16 秒内未检测到 Turnstile 验证框渲染，判定组件加载异常")
+                return "missing"
+            sb.sleep(2)
+            continue
+
         if elapsed > 6 and clicked_times < 3 and (time.time() - last_click_ts >= 12):
             clicked_times += 1
-            attempt_click_cf(sb, clicked_times)
+            attempt_click_cf(sb, clicked_times, allow_generic_box=False)
             last_click_ts = time.time()
             sb.sleep(5)
             continue
 
         sb.sleep(2)
 
-    print("[Auth] 登录页 Turnstile 等待超时，仍将尝试提交登录")
-    return False
+    print("[Auth] 登录页 Turnstile 等待超时")
+    return "timeout"
 
 
 def login_play_hosting(sb: Any, email: str, password: str) -> None:
@@ -459,46 +561,56 @@ def login_play_hosting(sb: Any, email: str, password: str) -> None:
     sb.activate_cdp_mode(LOGIN_URL)
     sb.sleep(4)
 
-    wait_for_login_form_or_bypass_cf(sb, max_wait=80)
-    if "/auth/login" not in (sb.cdp.get_current_url() or ""):
-        return
-
-    # 进入登录页后先等待并清理可能出现的 GDPR 弹窗
-    sb.sleep(1.5)
-    dismiss_consent_modal(sb)
-
     email_sel = 'input[type="email"], input[name="email"], input[autocomplete="email"]'
     pass_sel = 'input[type="password"]'
 
-    sb.cdp.click(email_sel)
-    sb.sleep(random.uniform(0.2, 0.5))
-    sb.cdp.type(email_sel, email)
-    sb.sleep(random.uniform(0.4, 0.9))
+    # 若遇 Turnstile 组件未加载出来，自动刷新登录页重试 1 次
+    for page_try in range(1, 3):
+        if page_try > 1:
+            print("[Auth] 刷新登录页重新加载 Turnstile 组件...")
+            sb.cdp.open(LOGIN_URL)
+            sb.sleep(4)
 
-    dismiss_consent_modal(sb)
-
-    sb.cdp.click(pass_sel)
-    sb.sleep(random.uniform(0.2, 0.5))
-    sb.cdp.type(pass_sel, password)
-    sb.sleep(random.uniform(0.5, 1.0))
-
-    wait_and_solve_login_turnstile(sb, max_wait=55)
-
-    dismiss_consent_modal(sb)
-    if not click_button_by_text(sb, "Log in", require_ready=False):
-        sb.cdp.click('button[type="submit"]')
-    print("[Auth] 已点击 Log in，等待登录跳转...")
-
-    deadline = time.time() + 35
-    while time.time() < deadline:
-        cur_url = sb.cdp.get_current_url() or ""
-        if "/auth/login" not in cur_url:
-            print(f"[Auth] 登录成功，当前页面: {cur_url}")
-            sb.sleep(random.uniform(2.0, 3.5))
+        wait_for_login_form_or_bypass_cf(sb, max_wait=80)
+        if "/auth/login" not in (sb.cdp.get_current_url() or ""):
             return
-        sb.sleep(1.5)
 
-    raise RuntimeError("登录超时或失败（可能账号密码错误或未通过 Cloudflare 验证）")
+        sb.sleep(2.0)
+        dismiss_consent_modal(sb)
+
+        fill_input_verified(sb, email_sel, email, "邮箱")
+        sb.sleep(random.uniform(0.3, 0.7))
+        fill_input_verified(sb, pass_sel, password, "密码")
+        sb.sleep(random.uniform(0.5, 1.0))
+
+        ts_status = wait_and_solve_login_turnstile(sb, max_wait=55)
+        if ts_status == "missing" and page_try == 1:
+            continue
+
+        dismiss_consent_modal(sb)
+        if get_input_value(sb, email_sel) != email:
+            fill_input_verified(sb, email_sel, email, "邮箱")
+        if get_input_value(sb, pass_sel) != password:
+            fill_input_verified(sb, pass_sel, password, "密码")
+
+        if not click_button_by_text(sb, "Log in", require_ready=False):
+            sb.cdp.click('button[type="submit"]')
+        print("[Auth] 已点击 Log in，等待登录跳转...")
+
+        deadline = time.time() + 35
+        while time.time() < deadline:
+            cur_url = sb.cdp.get_current_url() or ""
+            if "/auth/login" not in cur_url:
+                print(f"[Auth] 登录成功，当前页面: {cur_url}")
+                sb.sleep(random.uniform(2.0, 3.5))
+                return
+            sb.sleep(1.5)
+
+        if page_try == 1:
+            print("[Auth] 本次提交未跳转，刷新登录页重试一次...")
+            continue
+
+    raise RuntimeError("登录超时或失败（可能账号密码错误、Turnstile 未加载或验证未通过）")
 
 
 def open_server_page(sb: Any, server_id: str) -> str:
@@ -552,10 +664,18 @@ def detect_server_state(sb: Any) -> str:
     if "Restoring server" in body_text or "Resuming your server" in body_text:
         return "restoring"
 
+    badge = get_top_status_badge(sb)
+    if badge == "online":
+        return "online"
+    if badge == "starting":
+        return "starting"
+    if badge in ("offline", "stopping"):
+        return "offline"
+
     has_stop = is_button_text_visible(sb, "Stop")
     has_restart = is_button_text_visible(sb, "Restart")
     if has_stop or has_restart:
-        if "Starting" in body_text and "Online" not in body_text:
+        if "Starting for " in body_text or "Pre-start tasks" in body_text:
             return "starting"
         return "online"
 
@@ -578,10 +698,12 @@ def click_start_button(sb: Any, max_wait: int = 45) -> None:
     while time.time() < deadline:
         dismiss_consent_modal(sb)
 
-        # 若服务器已自动进入启动/在线态，无需再点
         cur_state = detect_server_state(sb)
         if cur_state in ("starting", "online"):
-            print(f"[Action] 服务器已自动变为 {cur_state}，跳过点击 Start")
+            print(f"[Action] 服务器已变为 {cur_state}，跳过点击 Start")
+            return
+        if cur_state in ("limbo", "restoring"):
+            print(f"[Action] 等待 Start 期间服务器进入 {cur_state}，交由外层重新唤醒")
             return
 
         if click_button_by_text(sb, "Start", in_header_only=True, require_ready=True):
@@ -602,7 +724,6 @@ def click_start_button(sb: Any, max_wait: int = 45) -> None:
             logged_waiting = True
         sb.sleep(2.5)
 
-    # 超时前最后尝试强制点击一次
     if click_button_by_text(sb, "Start", require_ready=False):
         print("[Action] 等待超时，已尝试兜底点击 Start 按钮")
         return
@@ -623,32 +744,35 @@ def wait_for_restore_complete(sb: Any, max_wait: int = 240) -> str:
 
 
 def wait_for_boot(sb: Any, max_wait: int = 120) -> str:
-    print("[Action] 等待服务器启动（最长 2 分钟）...")
+    print(f"[Action] 等待服务器完成启动变为 Online（最长 {max_wait}s）...")
     deadline = time.time() + max_wait
-    reached_starting = False
-    starting_since: Optional[float] = None
     retried_start = False
     start_ts = time.time()
 
     while time.time() < deadline:
         state = detect_server_state(sb)
         print(f"[Action] 开机检查当前状态: {state}")
+
         if state == "online":
-            return "online"
-        if state == "starting":
-            if not reached_starting:
-                reached_starting = True
-                starting_since = time.time()
-            elif starting_since and time.time() - starting_since >= 35:
-                return "starting"
-        elif state == "offline" and not retried_start and (time.time() - start_ts >= 12):
-            # 若第一次点击刚好撞上面板重连未生效，补点一次
-            print("[Action] 12 秒后仍为 offline，补点一次 Start 按钮...")
+            sb.sleep(5)
+            confirm_state = detect_server_state(sb)
+            print(f"[Action] 5s 后复核状态: {confirm_state}")
+            if confirm_state == "online":
+                return "online"
+            state = confirm_state
+
+        if state in ("limbo", "restoring"):
+            print(f"[Action] 启动过程中检测到服务器掉回 {state}！")
+            return state
+
+        if state == "offline" and not retried_start and (time.time() - start_ts >= 15):
+            print("[Action] 15 秒后仍为 offline，补点一次 Start 按钮...")
             retried_start = True
             try:
                 click_start_button(sb, max_wait=20)
             except Exception as e:
                 print(f"[Action] 补点 Start 失败: {e}")
+
         sb.sleep(5)
 
     return detect_server_state(sb)
@@ -678,91 +802,129 @@ def process_single_account(
     proxy_url = account["proxy"]
 
     masked = mask_email(email)
-    local_port = BASE_PROXY_PORT + index
     screenshot_path = os.path.join(
         SCREENSHOT_DIR, f"{index:02d}_{sanitize_filename(name)}.png"
     )
 
     print(f"\n==================== [{index}/{total}] {name} ({masked}) ====================")
 
-    proxy = SingBoxProxy(proxy_url, local_port=local_port)
-    user_data_dir = tempfile.mkdtemp(prefix=f"ph_uc_profile_{index}_")
     actions: List[str] = []
     initial_state = "unknown"
     final_state = "unknown"
     current_url = ""
     error_msg = ""
+    exit_ip = ""
+    protocol = "direct"
 
-    try:
-        local_proxy = proxy.start()
-        sb_proxy = (
-            local_proxy.replace("http://", "").replace("https://", "")
-            if local_proxy
-            else None
-        )
-        viewport = random.choice(VIEWPORT_POOL)
+    for retry_no in range(1, MAX_ACCOUNT_RETRIES + 1):
+        if retry_no > 1:
+            wait_sec = random.uniform(8.0, 15.0)
+            print(f"[Retry] {name} 第 {retry_no - 1} 次失败，等待 {wait_sec:.1f}s 后进行第 {retry_no} 次重试...")
+            time.sleep(wait_sec)
 
-        with SB(
-            uc=True,
-            headless=False,
-            proxy=sb_proxy,
-            user_data_dir=user_data_dir,
-            locale_code="en",
-        ) as sb:
-            try:
-                sb.driver.set_window_rect(
-                    x=0, y=0, width=viewport["width"], height=viewport["height"]
-                )
-            except Exception:
-                sb.set_window_size(viewport["width"], viewport["height"])
+        local_port = BASE_PROXY_PORT + index * 10 + retry_no
+        proxy = SingBoxProxy(proxy_url, local_port=local_port)
+        user_data_dir = tempfile.mkdtemp(prefix=f"ph_uc_profile_{index}_{retry_no}_")
 
-            try:
-                login_play_hosting(sb, email, password)
-                current_url = open_server_page(sb, server_id)
+        actions = []
+        initial_state = "unknown"
+        final_state = "unknown"
+        current_url = ""
+        error_msg = ""
 
-                initial_state = detect_server_state(sb)
-                print(f"[Status] 初始服务器状态: {initial_state}")
-                state = initial_state
+        try:
+            local_proxy = proxy.start()
+            exit_ip = proxy.exit_ip or ""
+            protocol = proxy.protocol
+            sb_proxy = (
+                local_proxy.replace("http://", "").replace("https://", "")
+                if local_proxy
+                else None
+            )
+            viewport = random.choice(VIEWPORT_POOL)
 
-                if state == "limbo":
-                    if not click_button_by_text(sb, "Wake server"):
-                        raise RuntimeError("检测到 Limbo 状态，但未找到 Wake server 按钮")
-                    actions.append("点击 Wake server 唤醒")
-                    sb.sleep(3)
-                    state = wait_for_restore_complete(sb)
-                elif state == "restoring":
-                    actions.append("等待服务器恢复完成")
-                    state = wait_for_restore_complete(sb)
+            with SB(
+                uc=True,
+                headless=False,
+                proxy=sb_proxy,
+                user_data_dir=user_data_dir,
+                locale_code="en",
+            ) as sb:
+                try:
+                    sb.driver.set_window_rect(
+                        x=0, y=0, width=viewport["width"], height=viewport["height"]
+                    )
+                except Exception:
+                    sb.set_window_size(viewport["width"], viewport["height"])
 
-                if state == "offline":
-                    click_start_button(sb, max_wait=45)
-                    actions.append("点击 Start 开机")
-                    sb.sleep(4)
-                    state = wait_for_boot(sb)
-                elif state == "starting":
-                    actions.append("等待启动完成")
-                    state = wait_for_boot(sb, max_wait=60)
-                elif state == "online":
-                    actions.append("运行正常，无需操作")
+                try:
+                    login_play_hosting(sb, email, password)
+                    current_url = open_server_page(sb, server_id)
 
-                final_state = state
-                sb.sleep(2)
-                save_cdp_screenshot(sb, screenshot_path)
-                print(f"[Done] {name} 最终状态: {final_state}，截图: {screenshot_path}")
+                    initial_state = detect_server_state(sb)
+                    print(f"[Status] 初始服务器状态: {initial_state}")
+                    state = initial_state
 
-            except Exception as e:
+                    for attempt in range(1, 3):
+                        if state == "limbo":
+                            if not click_button_by_text(sb, "Wake server"):
+                                raise RuntimeError("检测到 Limbo 状态，但未找到 Wake server 按钮")
+                            actions.append(
+                                "点击 Wake server 唤醒" if attempt == 1 else "掉回休眠，重新唤醒"
+                            )
+                            sb.sleep(3)
+                            state = wait_for_restore_complete(sb)
+                        elif state == "restoring":
+                            actions.append("等待服务器恢复完成")
+                            state = wait_for_restore_complete(sb)
+
+                        if state == "offline":
+                            click_start_button(sb, max_wait=45)
+                            state = detect_server_state(sb)
+                            if state in ("limbo", "restoring"):
+                                continue
+                            actions.append("点击 Start 开机")
+                            sb.sleep(4)
+                            state = wait_for_boot(sb, max_wait=120)
+                        elif state == "starting":
+                            if attempt == 1:
+                                actions.append("等待启动完成")
+                            state = wait_for_boot(sb, max_wait=120)
+                        elif state == "online":
+                            if attempt == 1:
+                                actions.append("运行正常，无需操作")
+                            break
+
+                        if state in ("online", "starting"):
+                            break
+                        if state in ("limbo", "restoring") and attempt == 1:
+                            print("[Action] 检测到服务器被踢回休眠，开始第 2 轮自动唤醒开机...")
+                            continue
+                        break
+
+                    final_state = state
+                    sb.sleep(2)
+                    save_cdp_screenshot(sb, screenshot_path)
+                    print(f"[Done] {name} 最终状态: {final_state}，截图: {screenshot_path}")
+
+                except Exception as e:
+                    error_msg = str(e)
+                    print(f"[Error] {name} 第 {retry_no} 次执行异常: {error_msg}")
+                    save_cdp_screenshot(sb, screenshot_path)
+                    raise
+
+        except Exception as e:
+            if not error_msg:
                 error_msg = str(e)
-                print(f"[Error] {name} 执行异常: {error_msg}")
-                save_cdp_screenshot(sb, screenshot_path)
-                raise
+            print(f"[Failed] {name} 第 {retry_no} 次尝试失败: {error_msg}")
+        finally:
+            proxy.stop()
+            shutil.rmtree(user_data_dir, ignore_errors=True)
 
-    except Exception as e:
-        if not error_msg:
-            error_msg = str(e)
-        print(f"[Failed] {name} 任务失败: {error_msg}")
-    finally:
-        proxy.stop()
-        shutil.rmtree(user_data_dir, ignore_errors=True)
+        if not error_msg and final_state in ("online", "starting"):
+            if retry_no > 1:
+                actions.insert(0, f"第{retry_no}次重试成功")
+            break
 
     ok = not error_msg and final_state in ("online", "starting")
 
@@ -779,8 +941,8 @@ def process_single_account(
         title = f"⚠️ [{index}/{total}] {name} 状态异常"
 
     proxy_info = (
-        f"{proxy.protocol.upper()} ({proxy.exit_ip})"
-        if proxy.exit_ip
+        f"{protocol.upper()} ({exit_ip})"
+        if exit_ip
         else ("直连" if not proxy_url else "代理连接失败")
     )
     action_text = " -> ".join(actions) if actions else "无"
@@ -816,7 +978,7 @@ def process_single_account(
         "ok": ok,
         "initial_state": initial_state,
         "final_state": final_state,
-        "exit_ip": proxy.exit_ip or "N/A",
+        "exit_ip": exit_ip or "N/A",
         "error": error_msg,
     }
 
